@@ -1,7 +1,7 @@
 {
   "type": "PTE",
   "templateUrl": "https://github.com/microsoft/AL-Go-PTE@main",
-  "templateSha": "a6b2e468579e02a31a9cc9a2ae178a1e6beadf00",
+  "templateSha": "81cff3d03e8fe6b88ee3fc0848594bfd4d9039a4",
   "enableCodeCop": true,
   "enableUICop": true,
   "CurrentSchedule": "0 2 * * *",
