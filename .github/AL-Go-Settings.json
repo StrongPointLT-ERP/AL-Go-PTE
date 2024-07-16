@@ -12,5 +12,7 @@
   "UpdateGitHubGoSystemFilesSchedule": "0 2 * * 1",
   "alDoc": {
     "continuousDeployment": true
-  }  
+  },
+  "rulesetFile": "sp.ruleset.json",
+  "enableExternalRulesets": true  
 }
