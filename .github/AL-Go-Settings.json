@@ -2,10 +2,15 @@
   "type": "PTE",
   "templateUrl": "https://github.com/microsoft/AL-Go-PTE@main",
   "templateSha": "81cff3d03e8fe6b88ee3fc0848594bfd4d9039a4",
+  "doNotRunBcptTests": true,
+  "doNotRunTests": true,  
   "enableCodeCop": true,
   "enableUICop": true,
   "CurrentSchedule": "0 2 * * *",
   "NextMinorSchedule": "0 2 * * 6",
   "NextMajorSchedule": "0 2 * * 0",
-  "UpdateGitHubGoSystemFilesSchedule": "0 2 * * 1"
+  "UpdateGitHubGoSystemFilesSchedule": "0 2 * * 1",
+  "alDoc": {
+    "continuousDeployment": true
+  }  
 }
