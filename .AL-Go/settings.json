@@ -1,5 +1,7 @@
 {
   "country": "lt",
+  "doNotPublishApps": true,
+  "useCompilerFolder": true,
   "appFolders": [],
   "testFolders": [],
   "bcptTestFolders": []
