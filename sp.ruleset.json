@@ -15,6 +15,16 @@
             "id": "AA0218",
             "action": "Error",
             "justification": "Make rule action as Error instead of Warning. ToolTip property for page fields must be mandatory."
+        },
+        {
+            "id": "LC0010",
+            "action": "Info",
+            "justification": "Disable rule LC0010. Cyclomatic complexity warning changed to info."
+        },
+        {
+            "id": "LC0064",
+            "action": "None",
+            "justification": "Make rule action as None instead of Info. Suggests moving ToolTips to table, but does not show in client if ToolTip missing in page. Might be a bug."
         }
     ]
 }
