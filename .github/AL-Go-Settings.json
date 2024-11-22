@@ -13,6 +13,9 @@
   "alDoc": {
     "continuousDeployment": true
   },
+  "DeliverToStorage": {
+    "CreateContainerIfNotExist": true
+  },
   "rulesetFile": "sp.ruleset.json",
   "enableExternalRulesets": true
 }
