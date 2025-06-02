@@ -2,3 +2,4 @@
 /.AL-Go/*
 /.github/workflows/*
 /.github/*
+*.md
