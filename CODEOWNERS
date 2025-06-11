@@ -2,4 +2,6 @@
 /.AL-Go/*
 /.github/workflows/*
 /.github/*
+**/*.rdl
+**/*.rdlc
 *.md
