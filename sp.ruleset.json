@@ -25,6 +25,11 @@
             "id": "LC0064",
             "action": "None",
             "justification": "Make rule action as None instead of Info. Suggests moving ToolTips to table, but does not show in client if ToolTip missing in page. Might be a bug."
+        },
+        {
+            "id": "LC0068",
+            "action": "None",
+            "justification": "Make rule action as None instead of Info. Informs the user that there are missing permission to access tabledata."
         }
     ]
 }
