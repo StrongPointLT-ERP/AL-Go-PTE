@@ -1,0 +1,32 @@
+name: AI Code Review
+on:
+    pull_request:
+        types: [opened, synchronize, reopened]
+
+concurrency:
+    group: ai-review-${{ github.event.pull_request.number }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+    pull-requests: write
+
+jobs:
+    review:
+        # Same-repo PRs only: fork PRs get no secrets and skip cleanly.
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        runs-on: ubuntu-latest
+        timeout-minutes: 40
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0
+            - uses: StrongPointLT-ERP/strongpoint-ai-reviewer@v1
+              # Optional inputs (see action.yml in that repo for all):
+              # with:
+              #   prompt-overlay: python        # or dotnet, terraform
+              #   severity-threshold: medium    # default: low
+              #   reviewers: generic,code_quality,security   # default: full roster
+              env:
+                  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+                  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
