@@ -2,6 +2,8 @@ name: AI Code Review
 on:
     pull_request:
         types: [opened, synchronize, reopened]
+        paths:
+            - '**/*.al'
 
 concurrency:
     group: ai-review-${{ github.event.pull_request.number }}
@@ -14,7 +16,7 @@ permissions:
 jobs:
     review:
         # Same-repo PRs only: fork PRs get no secrets and skip cleanly.
-        if: github.event.pull_request.head.repo.full_name == github.repository
+        if: github.event.pull_request.head.repo.full_name == github.repository && vars.ENABLE_AI_REVIEW == 'true'
         runs-on: ubuntu-latest
         timeout-minutes: 40
         steps:
