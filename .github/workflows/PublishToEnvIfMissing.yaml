@@ -1,0 +1,475 @@
+name: ' Publish To Environment (only if missing)'
+
+# =====================================================================
+# Same as PublishToEnvironment.yaml, with ONE difference:
+#
+#   The app is deployed only if it is NOT already installed in the target
+#   Business Central environment. If it is installed (any version), the
+#   deployment is skipped - no upgrade, no re-publish.
+#
+# Everything else (environment resolution, secrets, artifact download,
+# Deploy action) is copied from PublishToEnvironment.yaml, so authentication
+# and environment settings behave the same.
+#
+# The only additions are the "Check if app is already installed" step and
+# the `if:` conditions on the two deploy steps that depend on it.
+#
+# NOTE: all AL-Go actions here (and the AL-Go-Helper.ps1 download) point at the
+# `main` branch of microsoft/AL-Go-Actions, so there is no version to maintain.
+# The trade-off is that a breaking change upstream can break this workflow
+# without any change in this repo. The rest of the repo's workflows stay on
+# the pinned version that "Update AL-Go System Files" manages.
+# =====================================================================
+
+on:
+  # Daily at 04:00 UTC = 06:00 in Lithuania in winter (EET, UTC+2) and
+  # 07:00 in summer (EEST, UTC+3). GitHub cron is UTC-only, so it shifts by
+  # an hour with daylight saving. Scheduled runs only fire from the default branch.
+  schedule:
+    - cron: '0 4 * * *'
+    # Daily at 10:00 UTC (12:00 in Lithuanian winter, 13:00 in summer).
+    - cron: '0 10 * * *'
+  workflow_dispatch:
+    inputs:
+      environmentName:
+        description: Environment mask to receive the app (SANDBOX ONLY - production environments are blocked; * matches all, but production ones will fail the run)
+        required: true
+      createEnvIfNotExists:
+        description: Create environment if it does not exist (use with care, yourEnvName_AuthContext yourEnvName_EnvironmentName yourEnvName_Scope must be defined as environment secrets/variables or repo secrets/variables)
+        type: boolean
+        default: false
+
+permissions:
+  actions: read
+  contents: read
+  id-token: write
+  pull-requests: read
+  checks: read
+
+defaults:
+  run:
+    shell: powershell
+
+env:
+  ALGoOrgSettings: ${{ vars.ALGoOrgSettings }}
+  ALGoRepoSettings: ${{ vars.ALGoRepoSettings }}
+  # The version is fixed: this workflow always deploys the newest build
+  # (there is deliberately no appVersion input).
+  #
+  # Scheduled runs have no inputs, so the environment mask falls back to the
+  # repository variable PUBLISH_IF_MISSING_ENVIRONMENT (Settings > Secrets and
+  # variables > Actions > Variables, e.g. an exact sandbox environment name).
+  # Deliberately NOT '*', so a nightly run can never target every environment.
+  APP_VERSION: 'latest'
+  ENVIRONMENT_MASK: ${{ github.event.inputs.environmentName || vars.PUBLISH_IF_MISSING_ENVIRONMENT }}
+  CREATE_ENV_IF_NOT_EXISTS: ${{ github.event.inputs.createEnvIfNotExists || 'false' }}
+
+jobs:
+  # -------------------------------------------------------------------
+  # Initialization - unchanged from PublishToEnvironment.yaml (apart from
+  # the env-based inputs).
+  # Resolves which environments match the mask and (if no AuthContext
+  # secret exists) starts the device-code login.
+  # -------------------------------------------------------------------
+  Initialization:
+    needs: [ ]
+    runs-on: [ windows-latest ]
+    outputs:
+      environmentsMatrixJson: ${{ steps.DetermineDeploymentEnvironments.outputs.EnvironmentsMatrixJson }}
+      environmentCount: ${{ steps.DetermineDeploymentEnvironments.outputs.EnvironmentCount }}
+      deploymentEnvironmentsJson: ${{ steps.DetermineDeploymentEnvironments.outputs.DeploymentEnvironmentsJson }}
+      deviceCode: ${{ steps.Authenticate.outputs.deviceCode }}
+      telemetryScopeJson: ${{ steps.init.outputs.telemetryScopeJson }}
+    steps:
+      - name: Dump Workflow Information
+        uses: microsoft/AL-Go-Actions/DumpWorkflowInfo@main
+        with:
+          shell: powershell
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Initialize the workflow
+        id: init
+        uses: microsoft/AL-Go-Actions/WorkflowInitialize@main
+        with:
+          shell: powershell
+
+      - name: Read settings
+        id: ReadSettings
+        uses: microsoft/AL-Go-Actions/ReadSettings@main
+        with:
+          shell: powershell
+
+      - name: Determine Deployment Environments
+        id: DetermineDeploymentEnvironments
+        uses: microsoft/AL-Go-Actions/DetermineDeploymentEnvironments@main
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          shell: powershell
+          getEnvironments: ${{ env.ENVIRONMENT_MASK }}
+          type: 'Publish'
+          createEnvIfNotExists: ${{ env.CREATE_ENV_IF_NOT_EXISTS }}
+
+      - name: EnvName
+        id: envName
+        if: steps.DetermineDeploymentEnvironments.outputs.UnknownEnvironment == 1
+        run: |
+          $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
+          $envName = '${{ fromJson(steps.DetermineDeploymentEnvironments.outputs.environmentsMatrixJson).matrix.include[0].environment }}'.split(' ')[0]
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "envName=$envName"
+
+      - name: Read secrets
+        id: ReadSecrets
+        uses: microsoft/AL-Go-Actions/ReadSecrets@main
+        if: steps.DetermineDeploymentEnvironments.outputs.UnknownEnvironment == 1
+        with:
+          shell: powershell
+          gitHubSecrets: ${{ toJson(secrets) }}
+          getSecrets: '${{ steps.envName.outputs.envName }}-AuthContext,${{ steps.envName.outputs.envName }}_AuthContext,AuthContext'
+
+      - name: Authenticate
+        id: Authenticate
+        if: steps.DetermineDeploymentEnvironments.outputs.UnknownEnvironment == 1
+        run: |
+          $envName = '${{ steps.envName.outputs.envName }}'
+          $secretName = ''
+          $secrets = '${{ steps.ReadSecrets.outputs.Secrets }}' | ConvertFrom-Json
+          $authContext = $null
+          "$($envName)-AuthContext", "$($envName)_AuthContext", "AuthContext" | ForEach-Object {
+            if (!($authContext)) {
+              if ($secrets."$_") {
+                Write-Host "Using $_ secret as AuthContext"
+                $authContext = $secrets."$_"
+                $secretName = $_
+              }
+            }
+          }
+          if ($authContext) {
+            Write-Host "AuthContext provided in secret $secretName!"
+            Add-Content -Encoding UTF8 -path $ENV:GITHUB_STEP_SUMMARY -value "AuthContext was provided in a secret called $secretName. Using this information for authentication."
+          }
+          else {
+            Write-Host "No AuthContext provided for $envName, initiating Device Code flow"
+            $ALGoHelperPath = "$([System.IO.Path]::GetTempFileName()).ps1"
+            $webClient = New-Object System.Net.WebClient
+            $webClient.DownloadFile('https://raw.githubusercontent.com/microsoft/AL-Go-Actions/main/AL-Go-Helper.ps1', $ALGoHelperPath)
+            . $ALGoHelperPath
+            DownloadAndImportBcContainerHelper
+            $authContext = New-BcAuthContext -includeDeviceLogin -deviceLoginTimeout ([TimeSpan]::FromSeconds(0))
+            Add-Content -Encoding UTF8 -path $ENV:GITHUB_STEP_SUMMARY -value "AL-Go needs access to the Business Central Environment $('${{ steps.envName.outputs.envName }}'.Split(' ')[0]) and could not locate a secret called ${{ steps.envName.outputs.envName }}_AuthContext`n`n$($authContext.message)"
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "deviceCode=$($authContext.deviceCode)"
+          }
+
+  Deploy:
+    needs: [ Initialization ]
+    if: needs.Initialization.outputs.environmentCount > 0
+    strategy: ${{ fromJson(needs.Initialization.outputs.environmentsMatrixJson) }}
+    runs-on: ${{ fromJson(matrix.os) }}
+    name: Deploy to ${{ matrix.environment }}
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    environment:
+      name: ${{ matrix.environment }}
+      url: ${{ steps.Deploy.outputs.environmentUrl }}
+    env:
+      deviceCode: ${{ needs.Initialization.outputs.deviceCode }}
+      ALGoEnvSettings: ${{ vars.ALGoEnvironmentSettings }}
+      ALGoEnvName: ${{ matrix.environment }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: EnvName
+        id: envName
+        run: |
+          $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
+          $envName = '${{ matrix.environment }}'.split(' ')[0]
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "envName=$envName"
+
+      - name: Read settings
+        uses: microsoft/AL-Go-Actions/ReadSettings@main
+        with:
+          shell: ${{ matrix.shell }}
+          get: type,powerPlatformSolutionFolder
+
+      - name: Read secrets
+        id: ReadSecrets
+        uses: microsoft/AL-Go-Actions/ReadSecrets@main
+        with:
+          shell: ${{ matrix.shell }}
+          gitHubSecrets: ${{ toJson(secrets) }}
+          getSecrets: '${{ steps.envName.outputs.envName }}-AuthContext,${{ steps.envName.outputs.envName }}_AuthContext,AuthContext'
+
+      # NEW STEP - fail with a clear message when there is nothing to deploy.
+      # 'latest' resolves to non-expired build artifacts of the CI/CD run on this
+      # branch (same lookup AL-Go's GetArtifactsForDeployment does). If they have
+      # expired or been deleted, AL-Go would only fail with a cryptic error, so we
+      # check first and say exactly what to do. Only the "no artifacts at all" case
+      # gets this message; any other failure is reported as a normal failure.
+      - name: Check that a recent CI/CD build exists
+        id: ArtifactProbe
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $branch = $env:GITHUB_REF_NAME
+          $jq = "[.artifacts[] | select(.expired == false and (.name | test(""Apps-"")) and (.name | test(""TestApps-"") | not) and .workflow_run.head_branch == ""$branch"")] | length"
+          $count = [int](gh api "repos/$($env:GITHUB_REPOSITORY)/actions/artifacts?per_page=100" --jq $jq)
+          if ($LASTEXITCODE -ne 0) { throw "Could not list artifacts via the GitHub API." }
+          Write-Host "Non-expired app artifacts on '$branch': $count"
+          if ($count -eq 0) {
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "missing=true"
+            throw "No recent CI/CD build, run CI/CD first."
+          }
+
+      - name: Get Artifacts for deployment
+        uses: microsoft/AL-Go-Actions/GetArtifactsForDeployment@main
+        with:
+          shell: ${{ matrix.shell }}
+          artifactsVersion: ${{ env.APP_VERSION }}
+          artifactsFolder: '.artifacts'
+          buildMode: ${{ matrix.buildMode }}
+
+      # ================================================================
+      # NEW STEP - the whole point of this workflow.
+      #
+      # 1. Read the App ID(s) from the .app file(s) that were just downloaded
+      #    (so nothing is hard-coded - works for current/latest/PR_xx/etc.).
+      # 2. Authenticate to the environment the same way AL-Go's Deploy does.
+      # 3. Ask the environment which extensions are installed.
+      # 4. Set output installed=true only when ALL app IDs are installed.
+      #
+      # Versions are deliberately NOT compared: installed 1.0.0.0 + artifact
+      # 2.0.0.0 => still skipped.
+      # ================================================================
+      - name: Check if app is already installed
+        id: CheckInstalled
+        env:
+          Secrets: '${{ steps.ReadSecrets.outputs.Secrets }}'
+          # Passed via env (not inlined into the script) to avoid quoting problems with the JSON.
+          DeploymentEnvironmentsJson: ${{ needs.Initialization.outputs.deploymentEnvironmentsJson }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ProgressPreference = "SilentlyContinue"
+
+          # Same bootstrap AL-Go's own actions use: gives us BcContainerHelper
+          # (New-BcAuthContext, Get-BcInstalledExtensions, Get-AppJsonFromAppFile)
+          # and the ConvertTo-HashTable helper.
+          $ALGoHelperPath = "$([System.IO.Path]::GetTempFileName()).ps1"
+          (New-Object System.Net.WebClient).DownloadFile('https://raw.githubusercontent.com/microsoft/AL-Go-Actions/main/AL-Go-Helper.ps1', $ALGoHelperPath)
+          . $ALGoHelperPath
+          DownloadAndImportBcContainerHelper
+
+          # ------------------------------------------------------------
+          # 1. Collect App IDs from the deployment artifacts.
+          #    GetArtifactsForDeployment creates one folder per artifact:
+          #      <project>-<ref>-Apps-<ver>          <- the apps we deploy
+          #      <project>-<ref>-TestApps-<ver>      <- test apps (ignored)
+          #      <project>-<ref>-Dependencies-<ver>  <- dependencies (ignored)
+          #    Only the *Apps-* folders are relevant for "is my app there?".
+          # ------------------------------------------------------------
+          $artifactsFolder = Join-Path $env:GITHUB_WORKSPACE '.artifacts'
+          $appFiles = @(
+            Get-ChildItem -Path $artifactsFolder -Directory |
+              Where-Object { $_.Name -like '*Apps-*' -and $_.Name -notlike '*TestApps-*' } |
+              ForEach-Object { Get-ChildItem -Path $_.FullName -Filter '*.app' -File -Recurse }
+          )
+          if ($appFiles.Count -eq 0) {
+            throw "No .app files found in the *Apps-* artifact folders under $artifactsFolder."
+          }
+
+          $targetApps = @()
+          foreach ($appFile in $appFiles) {
+            # NB: a .app is NOT a plain zip (it has a NAVX header), so Expand-Archive
+            # cannot read it. Get-AppJsonFromAppFile is what AL-Go itself uses.
+            $appJson = Get-AppJsonFromAppFile -appFile $appFile.FullName
+            Write-Host "Artifact app: $($appJson.name) $($appJson.version) ($($appJson.id))"
+            $targetApps += [pscustomobject]@{ Id = "$($appJson.id)"; Name = $appJson.name; Version = $appJson.version }
+          }
+
+          # ------------------------------------------------------------
+          # 2. Authenticate - mirrors AL-Go Deploy.ps1.
+          #    * The AuthContext secret is BASE64-encoded JSON (must decode).
+          #    * If no secret exists, the device code from Initialization is used.
+          # ------------------------------------------------------------
+          $envName = '${{ matrix.environment }}'.Split(' ')[0]
+          $secrets = $env:Secrets | ConvertFrom-Json
+          $authContext = $null
+          foreach ($secretName in "$($envName)-AuthContext", "$($envName)_AuthContext", "AuthContext") {
+            if ($secrets."$secretName") {
+              $authContext = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($secrets."$secretName"))
+              Write-Host "Using secret $secretName for authentication."
+              break
+            }
+          }
+          if (-not $authContext) {
+            if ($env:deviceCode) {
+              $authContext = "{""deviceCode"":""$($env:deviceCode)""}"
+              Write-Host "Using device code for authentication."
+            }
+            else {
+              throw "No AuthContext found for environment '$envName'."
+            }
+          }
+          $authContextParams = $authContext | ConvertFrom-Json | ConvertTo-HashTable
+          $bcAuthContext = New-BcAuthContext @authContextParams
+          if ($null -eq $bcAuthContext) { throw "Authentication failed." }
+
+          # The real BC environment name comes from the deployment settings
+          # (the `EnvironmentName` property), which can differ from the
+          # GitHub environment name. AL-Go's Deploy does the same lookup.
+          $deploymentEnvironments = $env:DeploymentEnvironmentsJson | ConvertFrom-Json | ConvertTo-HashTable -recurse
+          $bcEnvironmentName = $deploymentEnvironments.'${{ matrix.environment }}'.EnvironmentName
+          if (-not $bcEnvironmentName) { $bcEnvironmentName = $envName }
+          Write-Host "Checking Business Central environment: $bcEnvironmentName"
+
+          # ------------------------------------------------------------
+          # PRODUCTION GUARD - this workflow must never publish to production.
+          # Uses the same endpoint AL-Go's Deploy uses to classify the environment
+          # (environmentType 1 = Sandbox). FAIL CLOSED: anything that is not
+          # positively identified as a ready sandbox stops the job here, before
+          # the Deploy step can run.
+          # ------------------------------------------------------------
+          $environmentUrl = "$($bcContainerHelperConfig.baseUrl.TrimEnd('/'))/$($bcAuthContext.tenantId)/$bcEnvironmentName"
+          $envInfo = Invoke-RestMethod -UseBasicParsing -Method Get -Uri "$environmentUrl/deployment/url"
+          if ($envInfo.Status -ne "Ready") {
+            throw "Environment '$bcEnvironmentName' is not ready (status: $($envInfo.Status)). Nothing was deployed."
+          }
+          if ($envInfo.environmentType -ne 1) {
+            $msg = "BLOCKED: '$bcEnvironmentName' is not a sandbox (environmentType=$($envInfo.environmentType)). This workflow only publishes to sandbox environments. Nothing was deployed."
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "## $msg"
+            throw $msg
+          }
+          Write-Host "Environment '$bcEnvironmentName' is a sandbox - OK."
+
+          # ------------------------------------------------------------
+          # 3. Query installed extensions (same call AL-Go uses internally
+          #    in CheckInstalledApps; isInstalled filters out uninstalled
+          #    leftovers that still show up in the list).
+          # ------------------------------------------------------------
+          $installedApps = @(
+            Get-BcInstalledExtensions -bcAuthContext $bcAuthContext -environment $bcEnvironmentName |
+              Where-Object { $_.isInstalled }
+          )
+          Write-Host "Installed extensions in environment: $($installedApps.Count)"
+
+          # ------------------------------------------------------------
+          # 4. Decide. Skip ONLY if every artifact app is already installed;
+          #    if any is missing we deploy (safer for multi-app repos).
+          # ------------------------------------------------------------
+          $missing = @($targetApps | Where-Object { $id = $_.Id; -not ($installedApps | Where-Object { $_.id -eq $id }) })
+
+          $summary = @("## Publish only if missing - $bcEnvironmentName", "")
+          foreach ($app in $targetApps) {
+            $installed = $installedApps | Where-Object { $_.id -eq $app.Id } | Select-Object -First 1
+            if ($installed) {
+              $summary += "- **$($app.Name)** - already installed as $($installed.versionMajor).$($installed.versionMinor).$($installed.versionBuild).$($installed.versionRevision) (artifact: $($app.Version)) - not touched"
+            }
+            else {
+              $summary += "- **$($app.Name)** $($app.Version) - not installed - will be deployed"
+            }
+          }
+
+          if ($missing.Count -eq 0) {
+            $summary += ""
+            $summary += "**Pre-check: app already installed - deployment will be skipped.**"
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "installed=true"
+          }
+          else {
+            $summary += ""
+            $summary += "**Pre-check: app is missing - deployment will run (final result is reported at the end).**"
+            Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "installed=false"
+          }
+          $summary | ForEach-Object { Write-Host $_ }
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value ($summary -join "`n")
+
+      # Only runs when the check said "not installed". Otherwise this step is
+      # skipped (shows as grey in the run) and the job still succeeds.
+      - name: Deploy to Business Central
+        id: Deploy
+        if: steps.CheckInstalled.outputs.installed != 'true'
+        uses: microsoft/AL-Go-Actions/Deploy@main
+        env:
+          Secrets: '${{ steps.ReadSecrets.outputs.Secrets }}'
+        with:
+          shell: ${{ matrix.shell }}
+          environmentName: ${{ matrix.environment }}
+          artifactsFolder: '.artifacts'
+          type: 'Publish'
+          deploymentEnvironmentsJson: ${{ needs.Initialization.outputs.deploymentEnvironmentsJson }}
+          artifactsVersion: ${{ env.APP_VERSION }}
+
+      # Also gated: if the app was already there, don't touch Power Platform either.
+      - name: Deploy to Power Platform
+        if: steps.CheckInstalled.outputs.installed != 'true' && env.type == 'PTE' && env.powerPlatformSolutionFolder != ''
+        uses: microsoft/AL-Go-Actions/DeployPowerPlatform@main
+        env:
+          Secrets: '${{ steps.ReadSecrets.outputs.Secrets }}'
+        with:
+          shell: ${{ matrix.shell }}
+          environmentName: ${{ matrix.environment }}
+          artifactsFolder: '.artifacts'
+          deploymentEnvironmentsJson: ${{ needs.Initialization.outputs.deploymentEnvironmentsJson }}
+
+      # ================================================================
+      # NEW STEP - final verdict for this environment. Runs ALWAYS (even after
+      # a failure) and states plainly what happened, both in the run summary
+      # and as an annotation at the top of the run page:
+      #   PUBLISHED        - app was missing, Deploy step succeeded
+      #   NOT NEEDED       - app already installed, nothing was done
+      #   FAILED / BLOCKED - something went wrong; nothing (or not everything)
+      #                      was published - see the failed step
+      # ================================================================
+      - name: Publishing result
+        if: always()
+        env:
+          ARTIFACTS_MISSING: ${{ steps.ArtifactProbe.outputs.missing }}
+          CHECK_OUTCOME: ${{ steps.CheckInstalled.outcome }}
+          CHECK_INSTALLED: ${{ steps.CheckInstalled.outputs.installed }}
+          DEPLOY_OUTCOME: ${{ steps.Deploy.outcome }}
+        run: |
+          $envName = '${{ matrix.environment }}'
+          if ($env:ARTIFACTS_MISSING -eq 'true') {
+            $verdict = "NOT PUBLISHED - no recent CI/CD build, run CI/CD first. (No non-expired build artifacts exist on this branch.)"
+            $level = 'error'
+          }
+          elseif ($env:CHECK_OUTCOME -ne 'success') {
+            $verdict = "NOT PUBLISHED - the pre-check did not complete (status: $($env:CHECK_OUTCOME)). Most likely the environment is not a sandbox, is not ready, or authentication failed. See the 'Check if app is already installed' step."
+            $level = 'error'
+          }
+          elseif ($env:CHECK_INSTALLED -eq 'true') {
+            $verdict = "NOT NEEDED - the app is already installed, so nothing was published."
+            $level = 'notice'
+          }
+          elseif ($env:DEPLOY_OUTCOME -eq 'success') {
+            $verdict = "PUBLISHED - the app was missing and has been deployed (version: latest)."
+            $level = 'notice'
+          }
+          else {
+            $verdict = "FAILED - the app was missing but deployment did not succeed (status: $($env:DEPLOY_OUTCOME)). See the 'Deploy to Business Central' step."
+            $level = 'error'
+          }
+          Write-Host "::$level title=Publish to ${envName}::$verdict"
+          Add-Content -Encoding UTF8 -Path $env:GITHUB_STEP_SUMMARY -Value "## Result for ${envName}`n`n**$verdict**"
+          if ($level -eq 'error') { exit 1 }
+
+  PostProcess:
+    needs: [ Initialization, Deploy ]
+    if: always()
+    runs-on: [ windows-latest ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Finalize the workflow
+        id: PostProcess
+        uses: microsoft/AL-Go-Actions/WorkflowPostProcess@main
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          shell: powershell
+          telemetryScopeJson: ${{ needs.Initialization.outputs.telemetryScopeJson }}
+          currentJobContext: ${{ toJson(job) }}
